@@ -1,0 +1,451 @@
+FUNCTION ZBW_DATASOURCE_ZRESERVATION.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  IMPORTING
+*"     VALUE(I_REQUNR) TYPE  SRSC_S_IF_SIMPLE-REQUNR
+*"     VALUE(I_DSOURCE) TYPE  SRSC_S_IF_SIMPLE-DSOURCE OPTIONAL
+*"     VALUE(I_MAXSIZE) TYPE  SRSC_S_IF_SIMPLE-MAXSIZE OPTIONAL
+*"     VALUE(I_INITFLAG) TYPE  SRSC_S_IF_SIMPLE-INITFLAG OPTIONAL
+*"     VALUE(I_READ_ONLY) TYPE  SRSC_S_IF_SIMPLE-READONLY OPTIONAL
+*"     VALUE(I_REMOTE_CALL) TYPE  SBIWA_FLAG DEFAULT SBIWA_C_FLAG_OFF
+*"  TABLES
+*"      I_T_SELECT TYPE  SRSC_S_IF_SIMPLE-T_SELECT OPTIONAL
+*"      I_T_FIELDS TYPE  SRSC_S_IF_SIMPLE-T_FIELDS OPTIONAL
+*"      E_T_DATA STRUCTURE  ZBW_RESERVATION OPTIONAL
+*"  EXCEPTIONS
+*"      NO_MORE_DATA
+*"      ERROR_PASSED_TO_MESS_HANDLER
+*"----------------------------------------------------------------------
+
+  TYPES:
+    BEGIN OF sty_reserv,
+
+      rsnum TYPE rsnum,
+      rspos TYPE rspos,
+
+    END OF sty_reserv.
+  TYPES:
+    BEGIN OF sty_aufnr,
+
+      aufnr TYPE aufnr,
+
+    END OF sty_aufnr.
+
+
+  STATICS ss_if TYPE srsc_s_if_simple.
+  STATICS sv_counter_datapakid TYPE sytabix.
+  STATICS s_cursor TYPE cursor.
+
+  DATA lt_date TYPE RANGE OF sydatum.
+  DATA ls_date LIKE LINE OF lt_date.
+  DATA ls_reserv TYPE sty_reserv.
+  DATA lt_reserv TYPE TABLE OF sty_reserv.
+  DATA lt_aufnr  TYPE TABLE OF sty_aufnr.
+  DATA lt_bapiret TYPE TABLE OF BAPIRET2.
+* Initialization mode (first call by SAPI) or data transfer mode
+* (following calls) ?
+  IF i_initflag = sbiwa_c_flag_on.
+
+************************************************************************
+* Initialization: check input parameters
+*                 buffer input parameters
+*                 prepare data selection
+************************************************************************
+
+* Check DataSource validity
+    CASE i_dsource.
+
+      WHEN 'ZRESERVATION'.
+
+      WHEN OTHERS.
+
+* this is a typical log call. Please write every error message like this
+        LOG_WRITE 'E'                  "message type
+                  'R3'                 "message class
+                  '009'                "message number
+                  I_DSOURCE   "message variable 1
+                  ' '.                 "message variable 2
+        RAISE ERROR_PASSED_TO_MESS_HANDLER.
+
+    ENDCASE.
+* Fill parameter buffer for data extraction calls
+    ss_if-requnr = i_requnr.
+    ss_if-dsource = i_dsource.
+    ss_if-maxsize = i_maxsize.
+    ss_if-t_select[] = I_T_SELECT[].
+* Fill field list table for an optimized select statement
+* (in case that there is no 1:1 relation between InfoSource fields
+* and database table fields this may be far from beeing trivial)
+    APPEND LINES OF i_t_fields TO ss_if-t_fields.
+
+  ELSE.                 "Initialization mode or data extraction ?
+
+************************************************************************
+* Data transfer: First Call      OPEN CURSOR + FETCH
+*                Following Calls FETCH only
+************************************************************************
+
+* First data package -> Read data
+    IF sv_counter_datapakid = 0.
+
+
+      DATA(lt_wa) = ss_if-t_select[].
+      DELETE lt_wa WHERE NOT fieldnm = 'RSDAT'.
+      LOOP AT lt_wa ASSIGNING FIELD-SYMBOL(<ls_wa>).
+
+        ls_date-sign  = <ls_wa>-sign.
+        ls_date-option = <ls_wa>-option.
+        ls_date-low = <ls_wa>-low.
+        ls_date-high = <ls_wa>-high.
+        APPEND ls_date TO lt_date.
+
+      ENDLOOP.
+
+      IF lines( lt_date ) > 0. "There is filter by date
+
+* Reservation by change
+        SELECT objectclas, objectid, changenr, udate
+          INTO TABLE @data(lt_cdhdr)
+          FROM cdhdr
+         WHERE objectclas EQ 'ORDER'
+           AND udate      IN @lt_date.
+        IF sy-subrc = 0.
+
+          SELECT *
+            INTO TABLE @data(lt_cdpos)
+            FROM cdpos
+             FOR ALL ENTRIES IN @lt_cdhdr
+           WHERE objectclas EQ @lt_cdhdr-objectclas
+             AND objectid   EQ @lt_cdhdr-objectid
+             AND changenr   EQ @lt_cdhdr-changenr
+             AND tabname    EQ 'RESB'.
+
+        ENDIF.
+        LOOP AT lt_cdpos ASSIGNING FIELD-SYMBOL(<ls_cdpos>).
+
+          ls_reserv-rsnum = <ls_cdpos>-tabkey+3(10).
+          ls_reserv-rspos = <ls_cdpos>-tabkey+13(4).
+          APPEND ls_reserv TO lt_reserv.
+
+        ENDLOOP.
+*   Reservation by creation
+        SELECT rkpf~rsnum resb~rspos
+               APPENDING TABLE lt_reserv
+               FROM rkpf
+               INNER JOIN resb ON ( rkpf~rsnum = resb~rsnum )
+               WHERE rkpf~rsdat IN lt_date.
+
+* Get orders
+*   ERDAT Fecha entrada
+        SELECT aufnr
+               INTO TABLE @DATA(lt_order)
+               FROM aufk
+               WHERE aufk~erdat IN @lt_date.
+*   AEDAT Fecha de modificación del maestro de orden
+        SELECT aufnr
+               APPENDING TABLE @lt_order
+               FROM aufk
+               WHERE aufk~aedat IN @lt_date.
+*   STDAT Fecha de la última modificación del status
+        SELECT aufnr
+               APPENDING TABLE @lt_order
+               FROM aufk
+               WHERE aufk~stdat IN @lt_date.
+
+        SORT lt_order BY aufnr.
+        DELETE ADJACENT DUPLICATES FROM lt_order COMPARING aufnr.
+        IF lines( lt_order ) > 1.
+
+*   Reservas por el número de grafo para imputación
+          SELECT resb~rsnum resb~rspos
+                 APPENDING TABLE lt_reserv
+                 FROM rkpf
+                 INNER JOIN resb ON rkpf~rsnum = resb~rsnum
+                 FOR ALL ENTRIES IN lt_order
+                 WHERE rkpf~nplnr = lt_order-aufnr.
+
+          SELECT resb~rsnum resb~rspos
+                 APPENDING TABLE lt_reserv
+                 FROM rkpf
+                 INNER JOIN resb ON rkpf~rsnum = resb~rsnum
+                 FOR ALL ENTRIES IN lt_order
+                 WHERE rkpf~aufnr = lt_order-aufnr.
+
+*   Reservas por la orden
+*        SELECT resb~rsnum resb~rspos
+*               APPENDING TABLE lt_reserv
+*               FROM rkpf
+*               INNER JOIN resb ON rkpf~rsnum = resb~rsnum
+*               FOR ALL ENTRIES IN lt_order
+*               WHERE rkpf~aufnr = lt_order-aufnr.
+
+        ENDIF.
+        SORT lt_reserv BY rsnum rspos.
+        DELETE ADJACENT DUPLICATES FROM lt_reserv COMPARING rsnum rspos.
+        IF lines( lt_reserv ) < 1.
+
+          RAISE no_more_data.
+
+        ENDIF.
+
+      ENDIF.
+
+* Determine number of database records to be read per FETCH statement
+* from input parameter I_MAXSIZE. If there is a one to one relation
+* between DataSource table lines and database entries, this is trivial.
+* In other cases, it may be impossible and some estimated value has to
+* be determined.
+      DATA(lt_resb_fields) = ss_if-t_fields[].
+      DELETE lt_resb_fields WHERE fieldnm = 'RSDAT' OR
+                                  fieldnm = 'USNAM' OR
+                                  fieldnm = 'BWART' OR
+                                  fieldnm = 'WEMPF' OR
+                                  fieldnm = 'KOSTL' OR
+                                  fieldnm = 'KOKRS' OR
+                                  fieldnm = 'IDAT2' OR
+                                  fieldnm = 'AENAM' OR
+                                  fieldnm = 'IDAT1' OR
+                                  fieldnm = 'SYS_STATUS' OR
+                                  fieldnm = 'EQUNR'.
+      IF lines( lt_reserv ) > 0. " Use the filter defined
+
+        OPEN CURSOR WITH HOLD s_cursor FOR
+             SELECT (lt_resb_fields) FROM resb
+                                    FOR ALL ENTRIES IN lt_reserv
+                                    WHERE rsnum = lt_reserv-rsnum
+                                      AND rspos = lt_reserv-rspos.
+
+      ELSE. "No filter definied read all reservations
+
+        OPEN CURSOR WITH HOLD s_cursor FOR
+             SELECT (lt_resb_fields) FROM resb.
+
+      ENDIF.
+
+    ENDIF.
+
+* Fetch records into interface table.
+*   named E_T_'Name of extract structure'.
+    FETCH NEXT CURSOR s_cursor
+               APPENDING CORRESPONDING FIELDS
+               OF TABLE e_t_data
+               PACKAGE SIZE ss_if-maxsize.
+
+    IF sy-subrc = 0.
+
+      SELECT rsnum, rsdat, usnam, bwart,
+             wempf, kostl, kokrs
+             INTO TABLE @DATA(lt_rkpf)
+             FROM rkpf
+             FOR ALL ENTRIES IN @e_t_data
+             WHERE rsnum = @e_t_data-rsnum.
+      SORT lt_rkpf BY rsnum.
+      DELETE ADJACENT DUPLICATES FROM lt_rkpf COMPARING rsnum.
+      SELECT rsnum, rspos, banfn, bnfpo,
+             ebeln, ebelp, aufnr, aufpo
+             INTO TABLE @DATA(lt_rsdb)
+             FROM rsdb
+             FOR ALL ENTRIES IN @e_t_data
+             WHERE rsnum = @e_t_data-rsnum.
+*               AND rspos = @e_t_data-rspos.
+      SORT lt_rsdb BY rsnum rspos.
+      LOOP AT e_t_data ASSIGNING FIELD-SYMBOL(<ls_data>).
+
+        READ TABLE lt_rkpf ASSIGNING FIELD-SYMBOL(<ls_rkpf>)
+             WITH KEY rsnum = <ls_data>-rsnum
+             BINARY SEARCH.
+        IF sy-subrc = 0.
+
+          <ls_data>-rsdat = <ls_rkpf>-rsdat.
+          <ls_data>-usnam = <ls_rkpf>-usnam.
+          <ls_data>-bwart = <ls_rkpf>-bwart.
+          <ls_data>-wempf = <ls_rkpf>-wempf.
+          <ls_data>-kostl = <ls_rkpf>-kostl.
+          <ls_data>-kokrs = <ls_rkpf>-kokrs.
+
+        ENDIF.
+        READ TABLE lt_rsdb TRANSPORTING NO FIELDS
+             WITH KEY rsnum = <ls_data>-rsnum
+                      rspos = <ls_data>-rspos
+             BINARY SEARCH.
+        IF sy-subrc = 0.
+
+          LOOP AT lt_rsdb ASSIGNING FIELD-SYMBOL(<ls_rsdb>)
+               FROM sy-tabix.
+
+            IF <ls_data>-banfn IS INITIAL.
+
+              <ls_data>-banfn = <ls_rsdb>-banfn.
+              <ls_data>-bnfpo = <ls_rsdb>-bnfpo.
+
+            ENDIF.
+            IF <ls_data>-ebeln IS INITIAL.
+
+              <ls_data>-ebeln = <ls_rsdb>-ebeln.
+              <ls_data>-ebelp = <ls_rsdb>-ebelp.
+
+            ENDIF.
+            IF <ls_data>-aufnr IS INITIAL.
+
+              <ls_data>-aufnr = <ls_rsdb>-aufnr.
+              <ls_data>-afpos = <ls_rsdb>-aufpo.
+
+            ENDIF.
+            AT END OF rsnum.
+
+              EXIT.
+
+            ENDAT.
+            AT END OF rspos.
+
+              EXIT.
+
+            ENDAT.
+
+          ENDLOOP.
+
+        ENDIF.
+
+      ENDLOOP.
+      lt_aufnr[] = CORRESPONDING #( e_t_data[] ).
+      DELETE lt_aufnr WHERE aufnr IS INITIAL.
+      SORT lt_aufnr.
+      DELETE ADJACENT DUPLICATES FROM lt_aufnr.
+      SELECT aufnr, aenam, idat1, idat2, equnr
+             FROM VIORD "aufk
+             INTO TABLE @DATA(lt_aufk)
+             FOR ALL ENTRIES IN @lt_aufnr
+             WHERE aufnr = @lt_aufnr-aufnr.
+      SORT lt_aufk BY aufnr.
+
+      SORT e_t_data BY aufnr.
+*     Loop on the list of maintanence orders because
+*       multiple reservations belong to a maintenance
+*       order, reading order data only once per order.
+      LOOP AT lt_aufnr ASSIGNING FIELD-SYMBOL(<ls_aufnr>).
+
+*       Find the values
+        READ TABLE lt_aufk ASSIGNING FIELD-SYMBOL(<ls_aufk>)
+             WITH KEY aufnr = <ls_aufnr>-aufnr
+             BINARY SEARCH.
+*  DATA ls_order_header TYPE bapi_alm_order_header_e.
+*        CLEAR ls_order_header.
+         DATA lv_order TYPE j_objnr.
+         DATA lv_line TYPE j_stext.
+         CONCATENATE 'OR' <ls_aufnr>-aufnr INTO lv_order.
+         CALL FUNCTION 'STATUS_TEXT_EDIT'
+           EXPORTING
+             objnr                   = lv_order
+             spras                   = 'S'
+           IMPORTING
+             LINE                    = lv_line
+           EXCEPTIONS
+             OBJECT_NOT_FOUND        = 1
+             OTHERS                  = 2.
+         IF sy-subrc <> 0.
+
+           CLEAR lv_line.
+
+         ENDIF.
+
+
+
+*        CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+*          EXPORTING
+*            number    = <ls_data>-aufnr
+*          IMPORTING
+*            es_header = ls_order_header
+*          TABLES
+*            return    = lt_bapiret.
+
+*       Fill the values
+        READ TABLE e_t_data TRANSPORTING NO FIELDS
+             WITH KEY aufnr = <ls_aufnr>-aufnr
+             BINARY SEARCH.
+        IF sy-subrc = 0.
+
+          LOOP AT e_t_data ASSIGNING <ls_data>
+               FROM sy-tabix.
+
+            <ls_data>-sys_status = lv_line.
+            IF <ls_aufk> IS ASSIGNED.
+
+              <ls_data>-idat2 = <ls_aufk>-idat2.
+              <ls_data>-aenam = <ls_aufk>-aenam.
+              <ls_data>-idat1 = <ls_aufk>-idat1.
+              <ls_data>-equnr = <ls_aufk>-equnr.
+"              <ls_data>-equnr = ls_order_header-equipment.
+
+            ENDIF.
+*            IF NOT ls_order_header IS INITIAL.
+*
+*
+*            ENDIF.
+            AT END OF aufnr.
+
+              EXIT.
+
+            ENDAT.
+
+          ENDLOOP.
+
+        ENDIF.
+        UNASSIGN <ls_aufk>.
+
+      ENDLOOP.
+
+*      LOOP AT e_t_data ASSIGNING <ls_data>.
+*
+*        READ TABLE lt_aufk ASSIGNING FIELD-SYMBOL(<ls_aufk>)
+*             WITH KEY aufnr = <ls_data>-aufnr
+*             BINARY SEARCH.
+*        IF sy-subrc = 0.
+*
+*          <ls_data>-idat2 = <ls_aufk>-idat2.
+*          <ls_data>-aenam = <ls_aufk>-aenam.
+*          <ls_data>-idat1 = <ls_aufk>-idat1.
+**          <ls_data>-astnr = <ls_aufk>-astnr.
+*
+*        ENDIF.
+*        CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+*          EXPORTING
+*            number    = <ls_data>-aufnr
+*          IMPORTING
+*            es_header = ls_order_header
+*          TABLES
+*            return    = lt_bapiret.
+*        IF sy-subrc = 0.
+*
+*          <ls_data>-sys_status = ls_order_header-sys_status.
+*          <ls_data>-equnr      = ls_order_header-equipment.
+*
+*        ENDIF.
+** In case of low performance, use
+** CALL FUNCTION             STATUS_TEXT_EDIT
+** FLG_USER_STAT                   X
+** OBJNR                           OR000057013707
+** ONLY_ACTIVE                     X
+** SPRAS                           sy-langu
+**
+** AND this internal table again
+**        READ TABLE lt_afih ASSIGNING FIELD-SYMBOL(<ls_afih>)
+**             WITH KEY aufnr = <ls_data>-aufnr.
+**        IF sy-subrc = 0.
+**
+**          <ls_data>-equnr = <ls_afih>-equnr.
+**
+**        ENDIF.
+*
+*      ENDLOOP.
+
+    ELSE.
+
+      CLOSE CURSOR s_cursor.
+      RAISE no_more_data.
+
+    ENDIF.
+    sv_counter_datapakid = sv_counter_datapakid + 1.
+
+  ENDIF.
+
+ENDFUNCTION.
