@@ -1,0 +1,823 @@
+FUNCTION zbw_datasource_zpur_req.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_REQUNR) TYPE  SRSC_S_IF_SIMPLE-REQUNR
+*"     VALUE(I_DSOURCE) TYPE  SRSC_S_IF_SIMPLE-DSOURCE OPTIONAL
+*"     VALUE(I_MAXSIZE) TYPE  SRSC_S_IF_SIMPLE-MAXSIZE OPTIONAL
+*"     VALUE(I_INITFLAG) TYPE  SRSC_S_IF_SIMPLE-INITFLAG OPTIONAL
+*"     VALUE(I_READ_ONLY) TYPE  SRSC_S_IF_SIMPLE-READONLY OPTIONAL
+*"     VALUE(I_REMOTE_CALL) TYPE  SBIWA_FLAG DEFAULT SBIWA_C_FLAG_OFF
+*"  TABLES
+*"      I_T_SELECT TYPE  SRSC_S_IF_SIMPLE-T_SELECT OPTIONAL
+*"      I_T_FIELDS TYPE  SRSC_S_IF_SIMPLE-T_FIELDS OPTIONAL
+*"      E_T_DATA STRUCTURE  ZBW_PUR_REQ OPTIONAL
+*"  EXCEPTIONS
+*"      NO_MORE_DATA
+*"      ERROR_PASSED_TO_MESS_HANDLER
+*"----------------------------------------------------------------------
+  TYPES:
+        BEGIN OF ts_zzaufnr,
+          zzaufnr TYPE aufnr,
+        END OF ts_zzaufnr.
+  TYPES:
+        BEGIN OF ts_bnf,
+          banfn    TYPE banfn,
+          bnfpo    TYPE bnfpo,
+          tdname   TYPE tdobname,
+          tabkey   TYPE cdtabkey,
+          objectid TYPE cdobjectv,
+        END OF ts_bnf.
+  TYPES:
+        BEGIN OF ts_cdpos,
+
+          tabkey     TYPE cdtabkey,
+          objectclas TYPE cdobjectcl,
+          objectid   TYPE cdobjectv,
+          changenr   TYPE cdchangenr,
+          value_new  TYPE cdfldvaln,
+          value_old  TYPE cdfldvaln,
+          tabname    TYPE tabname,
+          fname      TYPE fieldname,
+          chngind    TYPE cdchngind,
+
+        END OF ts_cdpos.
+  TYPES:
+        BEGIN OF ts_cd,
+
+          tabkey     TYPE cdtabkey,
+          objectclas TYPE cdobjectcl,
+          objectid   TYPE cdobjectv,
+          changenr   TYPE cdchangenr,
+          value_new  TYPE cdfldvaln,
+          value_old  TYPE cdfldvaln,
+          udate      TYPE cddatum,
+          utime      TYPE cduzeit,
+
+        END OF ts_cd.
+  TYPES tt_cd TYPE TABLE OF ts_cd
+        WITH NON-UNIQUE KEY objectclas
+                            objectid
+                            changenr.
+
+  STATICS ss_if TYPE srsc_s_if_simple.
+  STATICS sv_counter_datapakid TYPE sytabix.
+  STATICS s_cursor TYPE cursor.
+  STATICS lt_fields_eban TYPE srsc_t_fields.
+  FIELD-SYMBOLS:
+      <str_zbw_pur_req>    TYPE zbw_pur_req.
+
+  DATA lt_cdpos_ekgrp TYPE TABLE OF ts_cdpos.
+  DATA lt_cdpos_frgzu TYPE TABLE OF ts_cdpos.
+  DATA lt_cdpos_pack  TYPE TABLE OF ts_cdpos.
+  DATA lt_cdpos    TYPE TABLE OF ts_cdpos.
+  DATA lt_zzaufnr  TYPE TABLE OF ts_zzaufnr.
+  DATA lt_bnf      TYPE TABLE OF ts_bnf.
+  DATA lt_cd       TYPE tt_cd. "TABLE OF ts_cd.
+  DATA lt_cd_ekgrp TYPE tt_cd. "TABLE OF ts_cd.
+  DATA lt_date     TYPE RANGE OF sydatum.
+  DATA ls_date     LIKE LINE OF lt_date.
+  DATA lt_banfn    TYPE RANGE OF banfn.
+  DATA ls_banfn    LIKE LINE OF lt_banfn.
+  DATA lt_bnfpo    TYPE RANGE OF bnfpo.
+  DATA ls_bnfpo    LIKE LINE OF lt_bnfpo.
+  DATA lv_tdname   TYPE tdobname.
+  DATA lv_tabkey   TYPE cdtabkey.
+  DATA lv_release_code TYPE c.
+  DATA lc_cdpos     TYPE cursor.
+* Initialization mode (first call by SAPI) or data transfer mode
+* (following calls) ?
+  IF i_initflag = sbiwa_c_flag_on.
+
+************************************************************************
+* Initialization: check input parameters
+*                 buffer input parameters
+*                 prepare data selection
+************************************************************************
+
+* Check DataSource validity
+    CASE i_dsource.
+
+      WHEN 'ZPUR_REQ'.
+
+      WHEN OTHERS.
+
+* this is a typical log call. Please write every error message like this
+        log_write 'E'                  "message type
+                  'R3'                 "message class
+                  '009'                "message number
+                  i_dsource   "message variable 1
+                  ' '.                 "message variable 2
+        RAISE error_passed_to_mess_handler.
+
+    ENDCASE.
+* Fill parameter buffer for data extraction calls
+    ss_if-requnr = i_requnr.
+    ss_if-dsource = i_dsource.
+    ss_if-maxsize = i_maxsize.
+    ss_if-t_select[] = i_t_select[].
+* Fill field list table for an optimized select statement
+* (in case that there is no 1:1 relation between InfoSource fields
+* and database table fields this may be far from beeing trivial)
+    APPEND LINES OF i_t_fields TO ss_if-t_fields.
+
+
+  ELSE.                 "Initialization mode or data extraction ?
+
+************************************************************************
+* Data transfer: First Call      OPEN CURSOR + FETCH
+*                Following Calls FETCH only
+************************************************************************
+
+* First data package -> Read data
+    IF sv_counter_datapakid = 0.
+
+      DATA(lt_wa) = ss_if-t_select[].
+* Work only with one selection BANFN or BADAT
+      IF line_exists( lt_wa[ fieldnm = 'BANFN' ] ).
+
+*        DELETE lt_wa WHERE NOT fieldnm = 'BANFN'.
+        LOOP AT lt_wa ASSIGNING FIELD-SYMBOL(<ls_wa>)
+             WHERE fieldnm = 'BANFN'.
+
+          ls_banfn-sign  = <ls_wa>-sign.
+          ls_banfn-option = <ls_wa>-option.
+          ls_banfn-low = <ls_wa>-low.
+          ls_banfn-high = <ls_wa>-high.
+          APPEND ls_banfn TO lt_banfn.
+
+        ENDLOOP.
+        LOOP AT lt_wa ASSIGNING <ls_wa>
+             WHERE fieldnm = 'BNFPO'.
+
+          ls_bnfpo-sign  = <ls_wa>-sign.
+          ls_bnfpo-option = <ls_wa>-option.
+          ls_bnfpo-low = <ls_wa>-low.
+          ls_bnfpo-high = <ls_wa>-high.
+          APPEND ls_bnfpo TO lt_bnfpo.
+
+        ENDLOOP.
+        SELECT banfn, bnfpo FROM eban
+              INTO TABLE @DATA(lt_pur_req)
+              WHERE banfn IN @lt_banfn
+                AND bnfpo IN @lt_bnfpo.
+        SORT lt_pur_req BY banfn bnfpo.
+        DELETE ADJACENT DUPLICATES FROM lt_pur_req COMPARING banfn bnfpo.
+
+      ELSEIF line_exists( lt_wa[ fieldnm = 'BADAT' ] ).
+
+*   Document date
+        DELETE lt_wa WHERE NOT fieldnm = 'BADAT'.
+        LOOP AT lt_wa ASSIGNING <ls_wa>.
+
+          ls_date-sign  = <ls_wa>-sign.
+          ls_date-option = <ls_wa>-option.
+          ls_date-low = <ls_wa>-low.
+          ls_date-high = <ls_wa>-high.
+          APPEND ls_date TO lt_date.
+
+        ENDLOOP.
+        SELECT banfn, bnfpo FROM eban
+              INTO TABLE @lt_pur_req
+*   Document date
+              WHERE erdat IN @lt_date.
+*   Change date
+*                 OR lfdat IN @lt_date
+*   Purchase requisition date
+*                 OR badat IN @lt_date
+*   Purchase order date
+*                 OR bedat IN @lt_date
+*   Delivery date
+*                 OR creationdate IN @lt_date.
+*   Change date
+        SELECT banfn, bnfpo FROM eban
+              APPENDING TABLE @lt_pur_req
+              WHERE lfdat IN @lt_date.
+*   Purchase requisition date
+        SELECT banfn, bnfpo FROM eban
+              APPENDING TABLE @lt_pur_req
+              WHERE badat IN @lt_date.
+*   Purchase order date
+        SELECT banfn, bnfpo FROM eban
+              APPENDING TABLE @lt_pur_req
+              WHERE bedat IN @lt_date.
+*   Delivery date
+        SELECT banfn, bnfpo FROM eban
+              APPENDING TABLE @lt_pur_req
+              WHERE creationdate IN @lt_date.
+        SORT lt_pur_req BY banfn bnfpo.
+        DELETE ADJACENT DUPLICATES FROM lt_pur_req COMPARING banfn bnfpo.
+
+      ENDIF.
+      IF lines( lt_pur_req ) < 1.
+
+        RAISE no_more_data.
+
+      ELSE.
+
+* Determine number of database records to be read per FETCH statement
+* from input parameter I_MAXSIZE. If there is a one to one relation
+* between DataSource table lines and database entries, this is trivial.
+* In other cases, it may be impossible and some estimated value has to
+* be determined.
+        lt_fields_eban[] = ss_if-t_fields[].
+* Remove fields outside table EBAN
+        DELETE lt_fields_eban WHERE fieldnm = 'PEP' OR
+                                    fieldnm = 'ELPEP' OR
+                                    fieldnm = 'KOSTL' OR
+                                    fieldnm = 'ARBPL' OR
+                                    fieldnm = 'STAT_AN_APPR' OR
+                                    fieldnm = 'DT_REL' OR
+                                    fieldnm = 'DT_REL2' OR
+                                    fieldnm = 'DT_REL1' OR
+                                    fieldnm = 'DT_FIRST_TOSC' OR
+                                    fieldnm = 'DT_LAST_TOSC' OR
+                                    fieldnm = 'DT_TOSC_MM375' OR
+                                    fieldnm = 'LIGEN'.
+
+        OPEN CURSOR WITH HOLD s_cursor FOR
+             SELECT (lt_fields_eban) FROM eban
+                                    FOR ALL ENTRIES IN lt_pur_req
+                                    WHERE banfn = lt_pur_req-banfn
+                                      AND bnfpo = lt_pur_req-bnfpo.
+
+      ENDIF.
+
+    ENDIF.
+
+* Fetch records into interface table.
+*   named E_T_'Name of extract structure'.
+    FETCH NEXT CURSOR s_cursor
+               APPENDING CORRESPONDING FIELDS
+               OF TABLE e_t_data
+               PACKAGE SIZE ss_if-maxsize.
+    IF sy-subrc <> 0.
+
+      CLOSE CURSOR s_cursor.
+      RAISE no_more_data.
+
+    ELSE.
+
+* Prepare for auxiliary tables: CRHD
+      lt_zzaufnr[] = CORRESPONDING #( e_t_data[] ).
+      SORT lt_zzaufnr.
+      DELETE ADJACENT DUPLICATES FROM lt_zzaufnr.
+      DELETE lt_zzaufnr WHERE zzaufnr IS INITIAL.
+      IF lines( lt_zzaufnr ) > 0.
+
+        SELECT afih~aufnr, crhd~arbpl
+               FROM afih
+               INNER JOIN crhd ON afih~gewrk = crhd~objid
+               INTO TABLE @DATA(lt_crhd)
+               FOR ALL ENTRIES IN @lt_zzaufnr
+               WHERE afih~aufnr = @lt_zzaufnr-zzaufnr.
+        SORT lt_crhd BY aufnr.
+        DELETE ADJACENT DUPLICATES FROM lt_crhd COMPARING aufnr.
+
+      ENDIF.
+* Prepare for auxiliary tables: BNF
+      lt_bnf[] = CORRESPONDING #( e_t_data[] ).
+      SORT lt_bnf.
+      DELETE ADJACENT DUPLICATES FROM lt_bnf.
+      LOOP AT lt_bnf ASSIGNING FIELD-SYMBOL(<ls_bnf>).
+
+        CONCATENATE sy-mandt <ls_bnf>-banfn <ls_bnf>-bnfpo
+                 INTO <ls_bnf>-tabkey.
+        CONCATENATE <ls_bnf>-banfn <ls_bnf>-bnfpo
+                 INTO <ls_bnf>-tdname.
+        <ls_bnf>-objectid = <ls_bnf>-banfn.
+
+      ENDLOOP.
+      IF lines( lt_bnf ) > 0.
+*   Prepare for auxiliary tables: ZTMM375
+        SELECT banfn, bnfpo, fecha
+               INTO TABLE @DATA(lt_ztmm375)
+               FROM ztmm375
+               FOR ALL ENTRIES IN @lt_bnf
+                   WHERE bukrs LIKE '%'
+                     AND banfn = @lt_bnf-banfn.
+        SORT lt_ztmm375 BY banfn bnfpo.
+*   Prepare for auxiliary tables: EBKN
+        SELECT banfn, bnfpo, zebkn, ps_psp_pnr, kostl, aufnr
+               FROM ebkn
+               INTO TABLE @DATA(lt_ebkn)
+               FOR ALL ENTRIES IN @lt_bnf
+               WHERE banfn = @lt_bnf-banfn
+                 AND bnfpo = @lt_bnf-bnfpo.
+        SORT lt_ebkn BY banfn bnfpo zebkn.
+*   Prepare for auxiliary tables: STXL
+        SELECT tdname, clustr ", clustd
+               INTO TABLE @DATA(lt_stxl)
+               FROM stxl
+               FOR ALL ENTRIES IN @lt_bnf
+                   WHERE relid    = 'TX'
+                     AND tdobject = 'EBAN'
+                     AND tdname   = @lt_bnf-tdname
+                     AND tdid     = 'B08'.
+        SORT lt_stxl BY tdname clustr.
+        DELETE ADJACENT DUPLICATES FROM lt_stxl COMPARING tdname clustr.
+*   Prepare for auxiliary tables: CDPOS and CDHDR
+        OPEN CURSOR @lc_cdpos FOR
+        SELECT tabkey, objectclas, objectid, changenr,
+               value_new, value_old,
+               tabname, fname, chngind
+           FROM cdpos
+*           INTO TABLE @DATA(lt_cdpos)
+           FOR ALL ENTRIES IN @lt_bnf
+          WHERE objectclas = 'BANF'
+            AND objectid   = @lt_bnf-objectid.
+        WHILE NOT lc_cdpos IS INITIAL.
+
+          FETCH NEXT CURSOR lc_cdpos
+                INTO TABLE lt_cdpos_pack
+                PACKAGE SIZE 5000.
+          IF sy-subrc = 0.
+
+            DATA(lt_cdpos_temp) = lt_cdpos_pack[].
+            DELETE lt_cdpos_temp WHERE
+                                  NOT ( tabname    = 'EBAN' AND
+                                        fname      = 'FRGZU' AND
+                                        chngind    = 'U' AND
+                                        ( value_new = 'X' OR
+                                          value_new = 'XX' OR
+                                          value_new = 'XXX') ).
+            APPEND LINES OF lt_cdpos_temp TO lt_cdpos_frgzu.
+            lt_cdpos_temp = lt_cdpos_pack[].
+            DELETE lt_cdpos_temp WHERE
+                                  NOT tabname      =  'EBAN' AND
+                                      fname        =  'EKGRP' AND
+                                      chngind      =  'U' AND
+                                      value_new(1) =  'T' AND
+                                      value_old(1) <> 'T'.
+            APPEND LINES OF lt_cdpos_temp TO lt_cdpos_ekgrp.
+
+          ELSE.
+
+            CLOSE CURSOR lc_cdpos.
+
+          ENDIF.
+          CLEAR lt_cdpos_pack[].
+          CLEAR lt_cdpos_temp[].
+
+        ENDWHILE.
+        SORT lt_cdpos_frgzu BY tabkey objectclas objectid changenr.
+        DELETE ADJACENT DUPLICATES FROM lt_cdpos_frgzu
+               COMPARING tabkey objectclas objectid changenr.
+        SORT lt_cdpos_ekgrp BY tabkey objectclas objectid changenr.
+        DELETE ADJACENT DUPLICATES FROM lt_cdpos_ekgrp
+               COMPARING tabkey objectclas objectid changenr.
+
+      ENDIF.
+      IF lines( lt_cdpos_frgzu ) > 0.
+
+        SELECT objectclas, objectid, changenr, udate, utime
+           FROM cdhdr
+           INTO TABLE @DATA(lt_cdhdr)
+           FOR ALL ENTRIES IN @lt_cdpos_frgzu
+         WHERE objectclas = @lt_cdpos_frgzu-objectclas
+           AND objectid   = @lt_cdpos_frgzu-objectid
+           AND changenr   = @lt_cdpos_frgzu-changenr.
+
+        lt_cd = VALUE tt_cd( FOR ls_cdpos IN lt_cdpos_frgzu
+                             ( tabkey      = ls_cdpos-tabkey
+                               objectclas  = ls_cdpos-objectclas
+                               objectid    = ls_cdpos-objectid
+                               changenr    = ls_cdpos-changenr
+                               value_new   = ls_cdpos-value_new
+                               value_old   = ls_cdpos-value_old
+                               udate       =
+                                     lt_cdhdr[ objectclas = ls_cdpos-objectclas
+                                               objectid   = ls_cdpos-objectid
+                                               changenr   = ls_cdpos-changenr ]-udate
+                               utime       =
+                                     lt_cdhdr[ objectclas = ls_cdpos-objectclas
+                                               objectid   = ls_cdpos-objectid
+                                               changenr   = ls_cdpos-changenr ]-utime ) ).
+        SORT lt_cd BY tabkey     ASCENDING
+                      objectclas ASCENDING
+                      objectid   ASCENDING
+                      changenr   ASCENDING
+                      udate      DESCENDING
+                      utime      DESCENDING.
+
+      ENDIF.
+      CLEAR lt_cdpos_frgzu[].
+      CLEAR lt_cdhdr[].
+*   Prepare for auxiliary tables: CDPOS and CDHDR (for field EKGRP)
+*      IF lines( lt_bnf ) > 0.
+*        SELECT tabkey, objectclas, objectid, changenr,
+*               value_new, value_old,
+*               tabname, fname, chngind
+*           FROM cdpos
+*           INTO TABLE @lt_cdpos
+*           FOR ALL ENTRIES IN @lt_bnf
+*          WHERE objectclas = 'BANF'
+*            AND objectid   = @lt_bnf-objectid.
+*        DELETE lt_cdpos WHERE NOT tabname      =  'EBAN' AND
+*                                  fname        =  'EKGRP' AND
+*                                  chngind      =  'U' AND
+*                                  value_new(1) =  'T' AND
+*                                  value_old(1) <> 'T'.
+*        SORT lt_cdpos BY tabkey objectclas objectid changenr.
+*        DELETE ADJACENT DUPLICATES FROM lt_cdpos
+*               COMPARING tabkey objectclas objectid changenr.
+*      ENDIF.
+      IF lines( lt_cdpos_ekgrp ) > 0.
+
+        SELECT objectclas, objectid, changenr, udate, utime
+           FROM cdhdr
+           INTO TABLE @lt_cdhdr
+           FOR ALL ENTRIES IN @lt_cdpos_ekgrp
+         WHERE objectclas = @lt_cdpos_ekgrp-objectclas
+           AND objectid   = @lt_cdpos_ekgrp-objectid
+           AND changenr   = @lt_cdpos_ekgrp-changenr.
+
+        lt_cd_ekgrp = VALUE tt_cd( FOR ls_cdpos IN lt_cdpos_ekgrp
+                             ( tabkey      = ls_cdpos-tabkey
+                               objectclas  = ls_cdpos-objectclas
+                               objectid    = ls_cdpos-objectid
+                               changenr    = ls_cdpos-changenr
+                               value_new   = ls_cdpos-value_new
+                               value_old   = ls_cdpos-value_old
+                               udate       =
+                                     lt_cdhdr[ objectclas = ls_cdpos-objectclas
+                                               objectid   = ls_cdpos-objectid
+                                               changenr   = ls_cdpos-changenr ]-udate
+                               utime       =
+                                     lt_cdhdr[ objectclas = ls_cdpos-objectclas
+                                               objectid   = ls_cdpos-objectid
+                                               changenr   = ls_cdpos-changenr ]-utime ) ).
+        SORT lt_cd_ekgrp BY tabkey     ASCENDING
+                      objectclas ASCENDING
+                      objectid   ASCENDING
+                      changenr   ASCENDING
+                      udate      DESCENDING
+                      utime      DESCENDING.
+
+      ENDIF.
+      CLEAR lt_cdpos_ekgrp[].
+      CLEAR lt_cdhdr[].
+*Following the program for the infoset query ZMM_SOLP001
+      LOOP AT e_t_data ASSIGNING FIELD-SYMBOL(<ls_e_t_data>).
+
+        READ TABLE lt_ztmm375 ASSIGNING FIELD-SYMBOL(<ls_ztmm375>)
+             WITH KEY banfn = <ls_e_t_data>-banfn
+                      bnfpo = <ls_e_t_data>-bnfpo.
+        IF sy-subrc = 0.
+
+          <ls_e_t_data>-dt_tosc_mm375 = <ls_ztmm375>-fecha.
+
+        ENDIF.
+        READ TABLE lt_ebkn TRANSPORTING NO FIELDS
+             WITH KEY banfn = <ls_e_t_data>-banfn
+                      bnfpo = <ls_e_t_data>-bnfpo
+             BINARY SEARCH.
+        IF sy-subrc = 0.
+
+          LOOP AT lt_ebkn ASSIGNING FIELD-SYMBOL(<ls_ebkn>)
+               FROM sy-tabix.
+
+            IF NOT <ls_ebkn>-ps_psp_pnr IS INITIAL.
+
+              <ls_e_t_data>-pep = <ls_ebkn>-ps_psp_pnr.
+              CALL FUNCTION 'CONVERSION_EXIT_ABPSP_OUTPUT'
+                EXPORTING
+                  input  = <ls_e_t_data>-pep
+                IMPORTING
+                  output = <ls_e_t_data>-elpep.
+
+            ENDIF.
+            IF NOT <ls_ebkn>-kostl IS INITIAL.
+
+              <ls_e_t_data>-kostl = <ls_ebkn>-kostl.
+
+            ENDIF.
+            IF NOT <ls_ebkn>-aufnr IS INITIAL AND
+               <ls_e_t_data>-knttp = 'F'.
+
+              <ls_e_t_data>-zzaufnr = <ls_ebkn>-aufnr.
+
+            ENDIF.
+            IF NOT <ls_e_t_data>-zzaufnr IS INITIAL.
+
+               READ TABLE lt_crhd ASSIGNING FIELD-SYMBOL(<ls_crhd>)
+                    WITH KEY aufnr = <ls_e_t_data>-zzaufnr
+                    BINARY SEARCH.
+               IF sy-subrc = 0.
+
+                 <ls_e_t_data>-arbpl = <ls_crhd>-arbpl.
+
+               ENDIF.
+
+            ENDIF.
+            AT END OF banfn.
+              EXIT.
+            ENDAT.
+            AT END OF bnfpo.
+              EXIT.
+            ENDAT.
+
+          ENDLOOP.
+
+        ENDIF.
+* Check text for approval analysis
+        <ls_e_t_data>-stat_an_appr = '00'.
+        IF <ls_e_t_data>-frgkz = 'P'.
+
+          CONCATENATE <ls_e_t_data>-banfn <ls_e_t_data>-bnfpo
+                 INTO lv_tdname.
+          READ TABLE lt_stxl TRANSPORTING NO FIELDS
+               WITH KEY tdname = lv_tdname.
+          IF sy-subrc = 0.
+
+            <ls_e_t_data>-stat_an_appr = '02'.
+
+          ELSE.
+
+            <ls_e_t_data>-stat_an_appr = '01'.
+
+          ENDIF.
+
+        ENDIF.
+* Release date
+        IF <ls_e_t_data>-loekz <> 'X' AND
+           NOT <ls_e_t_data>-frggr IS INITIAL.
+
+          IF <ls_e_t_data>-frggr = 'MX' OR <ls_e_t_data>-frggr = 'SV'.
+
+            lv_release_code = COND #(
+                 WHEN <ls_e_t_data>-frgzu = 'X'   THEN '1'
+                 WHEN <ls_e_t_data>-frgzu = 'XX'  THEN '2'
+                 WHEN <ls_e_t_data>-frgzu = 'XXX' THEN 'A'
+                 ELSE '' ).
+          ELSE.
+
+            lv_release_code = COND #(
+                 WHEN <ls_e_t_data>-frgzu = 'X'   THEN 'A'
+                 ELSE '' ).
+
+          ENDIF.
+          CONCATENATE sy-mandt <ls_e_t_data>-banfn <ls_e_t_data>-bnfpo
+                 INTO lv_tabkey.
+* For FRGZU
+          READ TABLE lt_cd TRANSPORTING NO FIELDS
+               WITH KEY tabkey = lv_tabkey.
+          IF sy-subrc = 0.
+
+            LOOP AT lt_cd ASSIGNING FIELD-SYMBOL(<ls_cd>)
+                 FROM sy-tabix.
+
+              IF <ls_cd>-value_new = 'XXX' AND
+                 <ls_e_t_data>-dt_rel IS INITIAL AND
+                 lv_release_code <> '1'.
+
+                <ls_e_t_data>-dt_rel = <ls_cd>-udate.
+
+              ELSEIF <ls_cd>-value_new = 'XX' AND
+                <ls_e_t_data>-dt_rel2 IS INITIAL AND
+                lv_release_code <> '1'.
+
+                <ls_e_t_data>-dt_rel2 = <ls_cd>-udate.
+
+              ELSEIF <ls_cd>-value_new = 'X' AND
+                <ls_e_t_data>-dt_rel1 IS INITIAL.
+
+                <ls_e_t_data>-dt_rel1 = <ls_cd>-udate.
+
+              ENDIF.
+
+            AT END OF tabkey.
+
+              EXIT.
+
+            ENDAT.
+
+            ENDLOOP.
+
+          ENDIF.
+
+        ENDIF.
+* FOR EKGRP
+        DATA lv_first_record TYPE c.
+        READ TABLE lt_cd TRANSPORTING NO FIELDS
+             WITH KEY tabkey = lv_tabkey.
+        IF sy-subrc = 0.
+
+          lv_first_record = 'X'.
+          LOOP AT lt_cd ASSIGNING <ls_cd>
+               FROM sy-tabix.
+
+            IF lv_first_record = 'X'.
+
+* Most recent assign to Service Center (ABS)
+              <ls_e_t_data>-dt_last_tosc = <ls_cd>-udate.
+              CLEAR lv_first_record.
+
+            ENDIF.
+
+          AT END OF tabkey.
+
+* First assign to Service Center (ABS)
+            <ls_e_t_data>-dt_first_tosc = <ls_cd>-udate.
+            EXIT.
+
+          ENDAT.
+
+          ENDLOOP.
+
+        ENDIF.
+        IF <ls_e_t_data>-estkz = 'B' OR
+           <ls_e_t_data>-estkz = 'U'.
+** Catalog status for the material in PurReq
+** Used the code in the FORM get_item_catalog_stat
+**      in program ZMMRG700
+
+          DATA lt_zmmt_eban TYPE zmmt_eban.
+          DATA ls_eban      TYPE eban.
+          DATA lv_count     TYPE i.
+          DATA lv_suwrt     TYPE ktwrt.
+          DATA lv_tabix     TYPE sytabix.
+          FIELD-SYMBOLS <ls_zmmt_eban> TYPE zmme_eban.
+          ls_eban = CORRESPONDING #( <ls_e_t_data> ).
+          CLEAR lt_zmmt_eban[].
+          CALL FUNCTION 'ZMMFG_CHECK_MAT_CATALOG'
+            EXPORTING
+              is_eban = ls_eban
+            TABLES
+              it_eban = lt_zmmt_eban.
+          CLEAR lv_count.
+
+* This part was used to check why the routine was working in RSA3 and not in the
+*    Data loading.
+* The issue was that the load is done in EN language and RSA3 is in ES
+*    And the function ZMMFG_CHECK_MAT_CATALOG has not text "error_desc"
+*    in EN.
+*          LOOP AT lt_zmmt_eban ASSIGNING FIELD-SYMBOL(<ls_tmp>).
+*
+*            WHILE SY-SUBRC = 0.
+*
+*              ASSIGN COMPONENT SY-INDEX OF STRUCTURE <ls_tmp> TO
+*              FIELD-SYMBOL(<COMP>).
+*              CHECK SY-SUBRC = 0.
+*              WRITE <COMP>.
+*
+*            ENDWHILE.
+*            WRITE /.
+*
+*          ENDLOOP.
+
+          IF ls_eban-flief IS INITIAL.
+
+            lv_count = REDUCE i(
+                       INIT x = 0
+                       FOR wa IN lt_zmmt_eban
+                       WHERE ( error_desc = space )
+                       NEXT x = x + 1 ).
+
+          ELSE.
+
+            lv_count = REDUCE i(
+                       INIT x = 0
+                       FOR wa IN lt_zmmt_eban
+                       WHERE ( error_desc = space AND
+                               lifnr      = ls_eban-flief )
+                       NEXT x = x + 1 ).
+
+            IF lv_count = 0.
+
+              lv_count = REDUCE i(
+                         INIT x = 0
+                         FOR wa IN lt_zmmt_eban
+                         WHERE ( error_desc = space )
+                         NEXT x = x + 1 ).
+
+            ENDIF.
+
+          ENDIF.
+          IF NOT lt_zmmt_eban[] IS INITIAL.
+
+*   Select contracts by material and plant
+            SELECT ekko~ebeln, ekpo~ebelp, ekpo~bukrs,
+                   ekko~bstyp, ekko~kdatb, ekko~kdate,
+                   ekpo~werks, ekpo~matnr, ekko~frgrl,
+                   ekko~ktwrt, ekko~waers, ekko~wkurs,
+                   ekpo~matkl, ekpo~loekz, ekpo~elikz,
+                   ekpo~pstyp
+              INTO TABLE @DATA(gt_ekko)
+              FROM ekko INNER JOIN ekpo
+                ON ekpo~ebeln = ekko~ebeln
+               FOR ALL ENTRIES IN @lt_zmmt_eban
+             WHERE ekko~bstyp IN ( 'K' , 'L' )
+               AND ekpo~loekz = @space
+               AND ekpo~matnr = @lt_zmmt_eban-matnr
+               AND ekpo~werks = @lt_zmmt_eban-werks
+               AND ekko~kdatb <= @sy-datum
+               AND ekko~kdate >= @sy-datum
+               AND ekko~frgrl = @space
+               AND ekpo~elikz = @space.
+
+            IF sy-subrc <> 0.
+
+*     Select contracts by PSCS and company
+              SELECT ekko~ebeln, ekpo~ebelp, ekpo~bukrs,
+                     ekko~bstyp, ekko~kdatb, ekko~kdate,
+                     ekpo~werks, ekpo~matnr, ekko~frgrl,
+                     ekko~ktwrt, ekko~waers, ekko~wkurs,
+                     ekpo~matkl, ekpo~loekz, ekpo~elikz,
+                     ekpo~pstyp
+                APPENDING TABLE @gt_ekko
+                FROM ekko INNER JOIN ekpo
+                  ON ekpo~ebeln = ekko~ebeln
+                 FOR ALL ENTRIES IN @lt_zmmt_eban
+               WHERE ekko~bstyp = 'K'
+                 AND ekko~bsart IN ( 'MK', 'WK' )
+                 AND ekko~kdatb <= @sy-datum
+                 AND ekko~kdate >= @sy-datum
+                 AND ekko~frgrl = @space
+                 AND ekko~bukrs = @lt_zmmt_eban-bukrs
+                 AND ekpo~matkl = @lt_zmmt_eban-matkl.
+
+              DELETE gt_ekko WHERE ( werks <> space AND werks <> <ls_e_t_data>-werks ) OR
+                                   loekz <> space OR
+                                   elikz = 'X'   OR
+                                   pstyp <> '8'.
+
+            ENDIF.
+            IF sy-subrc = 0.
+
+*     Check amount in contract
+              LOOP AT gt_ekko ASSIGNING FIELD-SYMBOL(<gs_ekko>).
+
+                lv_tabix = sy-tabix.
+                CALL FUNCTION 'ME_READ_RELEASE_DOCU'
+                     EXPORTING
+                              bukrs = <gs_ekko>-bukrs
+                              ebeln = <gs_ekko>-ebeln
+                              waers = <gs_ekko>-waers
+                              wkurs = <gs_ekko>-wkurs
+                     IMPORTING
+                              suwrt = lv_suwrt.
+                lv_suwrt = <gs_ekko>-ktwrt - lv_suwrt.
+                IF lv_suwrt <= 0.
+
+                  DELETE gt_ekko INDEX lv_tabix.
+
+                ENDIF.
+
+              ENDLOOP.
+
+            ENDIF.
+
+          ENDIF.
+*          DATA(lv_rec) = lines( lt_zmmt_eban ).
+*          WRITE: ls_eban-banfn,
+*                                          ls_eban-bnfpo,
+*                                          lv_rec,
+*                                          lv_count.
+          IF lv_count GT 1.
+
+            <ls_e_t_data>-ligen = '7'.
+
+          ELSEIF lv_count = 0.
+
+            LOOP AT lt_zmmt_eban ASSIGNING <ls_zmmt_eban>.
+
+              READ TABLE gt_ekko ASSIGNING <gs_ekko>
+                   WITH KEY matnr = <ls_zmmt_eban>-matnr
+                            werks = <ls_zmmt_eban>-werks.
+              IF sy-subrc <> 0.
+
+                READ TABLE gt_ekko ASSIGNING <gs_ekko>
+                     WITH KEY matkl = <ls_zmmt_eban>-matkl.
+
+                IF sy-subrc NE 0.
+
+                  <ls_e_t_data>-ligen = '5'.
+
+                ELSE.
+
+                  <ls_e_t_data>-ligen = '8'.
+
+                ENDIF.
+
+              ELSE.
+
+                <ls_e_t_data>-ligen = '8'.
+
+              ENDIF.
+              EXIT.
+
+            ENDLOOP.
+
+          ENDIF.
+
+        ENDIF.
+
+      ENDLOOP.
+
+    ENDIF.
+    sv_counter_datapakid = sv_counter_datapakid + 1.
+
+  ENDIF.
+
+ENDFUNCTION.
