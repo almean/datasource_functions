@@ -1,0 +1,188 @@
+FUNCTION zbw_datasource_zvbfa.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_REQUNR) TYPE  SRSC_S_IF_SIMPLE-REQUNR
+*"     VALUE(I_DSOURCE) TYPE  SRSC_S_IF_SIMPLE-DSOURCE OPTIONAL
+*"     VALUE(I_MAXSIZE) TYPE  SRSC_S_IF_SIMPLE-MAXSIZE OPTIONAL
+*"     VALUE(I_INITFLAG) TYPE  SRSC_S_IF_SIMPLE-INITFLAG OPTIONAL
+*"     VALUE(I_READ_ONLY) TYPE  SRSC_S_IF_SIMPLE-READONLY OPTIONAL
+*"     VALUE(I_REMOTE_CALL) TYPE  SBIWA_FLAG DEFAULT SBIWA_C_FLAG_OFF
+*"  TABLES
+*"      I_T_SELECT TYPE  SRSC_S_IF_SIMPLE-T_SELECT OPTIONAL
+*"      I_T_FIELDS TYPE  SRSC_S_IF_SIMPLE-T_FIELDS OPTIONAL
+*"      E_T_DATA STRUCTURE  ZBW_VBFA OPTIONAL
+*"  EXCEPTIONS
+*"      NO_MORE_DATA
+*"      ERROR_PASSED_TO_MESS_HANDLER
+*"----------------------------------------------------------------------
+* Static parameters
+  STATICS:
+    s_s_if              TYPE srsc_s_if_simple,
+    s_counter_datapakid LIKE sy-tabix,
+    lv_step(2)          TYPE c,
+    lc_cursor           TYPE cursor,
+    w_zbw_vbfa          LIKE zbw_vbfa,                      "02.08.2018
+    s_s_if_sel          TYPE srsc_s_if_simple,              "02.08.2018
+    lt_bw_ctrl_vbfa     TYPE TABLE OF zbw_ctrl_vbfa.
+
+*  RANGES r_vbelv FOR  zbw_ctrl_vbfa-vbeln.
+  STATICS r_vbelv TYPE RANGE OF vbeln.
+  DATA rs_vbelv LIKE LINE OF r_vbelv.
+  DATA:  w_fields TYPE rsfieldsel    .       "02.08.2018
+* Initialization mode (first call by SAPI) or data transfer mode
+* (following calls) ?
+  IF       i_initflag = sbiwa_c_flag_on.
+
+* Check DataSource validity
+    CASE i_dsource.
+      WHEN 'ZVBFA'.
+      WHEN OTHERS.
+        IF 1 = 2.
+
+          MESSAGE e009(r3).
+
+        ENDIF.
+* this is a typical log call. Please write every error message like this
+        log_write 'E'                  "message type
+                  'R3'                 "message class
+                  '009'                "message number
+                  i_dsource   "message variable 1
+                  ' '.                 "message variable 2
+        RAISE error_passed_to_mess_handler.
+
+    ENDCASE.
+    s_s_if-requnr  = i_requnr.
+    s_s_if-dsource = i_dsource.
+    s_s_if-maxsize = i_maxsize.
+    APPEND LINES OF i_t_fields TO s_s_if-t_fields.
+    APPEND LINES OF i_t_select TO s_s_if-t_select.
+    CLEAR r_vbelv[].
+* Reprocess ZBW_CTRL_VBFA
+    LOOP AT s_s_if-t_select INTO DATA(ls_select).
+
+      CASE ls_select-fieldnm.
+
+        WHEN 'VBELV'. " document (reprocess ZBW_CTRL_VBFA)
+
+          MOVE-CORRESPONDING ls_select TO rs_vbelv.
+          APPEND rs_vbelv TO r_vbelv.
+
+      ENDCASE.
+
+    ENDLOOP.
+    IF lines( r_vbelv ) > 0.
+
+      SUBMIT zbw_ctrl_vbfa_add
+             WITH p_vbeln IN r_vbelv
+             AND RETURN.
+
+    ENDIF.
+  ELSE.
+
+* Possible steps
+* VB - First cursor opened
+* VE - First cursor closed
+* NB - Second cursor opened
+* NE - Second cursor closed
+
+* First data package -> OPEN CURSOR
+
+    REFRESH:  s_s_if_sel-t_fields.
+
+    CLEAR : w_fields.
+    w_fields-fieldnm   =  'FKART'.
+    s_s_if_sel-t_fields[] = s_s_if-t_fields[].
+
+    DELETE s_s_if_sel-t_fields WHERE fieldnm   =  'FKART'.
+    IF s_counter_datapakid = 0.
+
+      lv_step = 'VB'.
+* Documentos comerciales guardados para cargar
+* If there is a filter for documents process only these documents
+    IF lines( r_vbelv ) > 0.
+
+      SELECT * FROM zbw_ctrl_vbfa
+             INTO TABLE lt_bw_ctrl_vbfa
+             WHERE vbeln IN r_vbelv.
+
+    ELSE.
+
+      SELECT * FROM zbw_ctrl_vbfa
+             INTO TABLE lt_bw_ctrl_vbfa.
+
+   ENDIF.
+* Hay registros?
+      IF lines( lt_bw_ctrl_vbfa ) = 0.
+
+        RAISE no_more_data.
+
+      ENDIF.
+* Leer datos de VBFA, step V*
+
+      OPEN CURSOR WITH HOLD lc_cursor FOR
+*           SELECT (s_s_if-t_fields) FROM vbfa                     "02.08.2018
+           SELECT (s_s_if_sel-t_fields) FROM vbfa                         "02.08.2018
+                                    FOR ALL ENTRIES IN lt_bw_ctrl_vbfa
+                                    WHERE vbelv = lt_bw_ctrl_vbfa-vbeln AND
+                                          posnv = lt_bw_ctrl_vbfa-posnr.
+
+    ENDIF.
+    IF lv_step = 'VE'.
+
+* Leer datos de VBFA, step N*
+      OPEN CURSOR WITH HOLD lc_cursor FOR
+*           SELECT (s_s_if-t_fields) FROM vbfa                      "02.08.2018
+            SELECT (s_s_if_sel-t_fields) FROM vbfa                         "02.08.2018
+                  FOR ALL ENTRIES IN lt_bw_ctrl_vbfa
+                  WHERE vbeln = lt_bw_ctrl_vbfa-vbeln AND
+                        posnn = lt_bw_ctrl_vbfa-posnr.
+      lv_step = 'NB'.
+
+    ELSEIF lv_step = 'NE'.
+
+* Borrar los datos de control de delta, si se trata de una prueba
+      IF i_requnr <> 'TEST'.
+
+        DELETE zbw_ctrl_vbfa FROM TABLE lt_bw_ctrl_vbfa.
+
+      ENDIF.
+      RAISE no_more_data.
+
+    ENDIF.
+    DO.
+
+      FETCH NEXT CURSOR lc_cursor
+            APPENDING CORRESPONDING FIELDS
+            OF TABLE e_t_data
+            PACKAGE SIZE s_s_if-maxsize.
+      IF sy-subrc <> 0.
+
+        CLOSE CURSOR lc_cursor.
+        IF lv_step = 'NB'.
+
+          lv_step = 'NE'.
+
+        ELSEIF lv_step = 'VB'.
+
+          lv_step = 'VE'.
+
+        ENDIF.
+        EXIT.
+
+      ENDIF.
+
+    ENDDO.
+    s_counter_datapakid = s_counter_datapakid + 1.
+****   Start   -  Include type of invoice   - 02.08.2018
+    LOOP  AT e_t_data  INTO w_zbw_vbfa WHERE vbtyp_n = 'M'.
+      CLEAR:  w_zbw_vbfa-fkart.
+      SELECT SINGLE fkart  INTO w_zbw_vbfa-fkart
+         FROM  vbrk  WHERE vbeln  =  w_zbw_vbfa-vbeln.
+
+      MODIFY e_t_data FROM  w_zbw_vbfa.
+    ENDLOOP.
+****   Finish  -  Include type of invoice   - 02.08.2018
+  ENDIF.
+
+ENDFUNCTION.
