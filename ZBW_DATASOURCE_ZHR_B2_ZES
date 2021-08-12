@@ -1,0 +1,202 @@
+FUNCTION ZBW_DATASOURCE_ZHR_B2_ZES.
+*"----------------------------------------------------------------------
+*"*"Interfase local
+*"  IMPORTING
+*"     VALUE(I_REQUNR) TYPE  SRSC_S_IF_SIMPLE-REQUNR
+*"     VALUE(I_DSOURCE) TYPE  SRSC_S_IF_SIMPLE-DSOURCE OPTIONAL
+*"     VALUE(I_MAXSIZE) TYPE  SRSC_S_IF_SIMPLE-MAXSIZE OPTIONAL
+*"     VALUE(I_INITFLAG) TYPE  SRSC_S_IF_SIMPLE-INITFLAG OPTIONAL
+*"     VALUE(I_READ_ONLY) TYPE  SRSC_S_IF_SIMPLE-READONLY OPTIONAL
+*"     VALUE(I_REMOTE_CALL) TYPE  SBIWA_FLAG DEFAULT SBIWA_C_FLAG_OFF
+*"  TABLES
+*"      I_T_SELECT TYPE  SRSC_S_IF_SIMPLE-T_SELECT OPTIONAL
+*"      I_T_FIELDS TYPE  SRSC_S_IF_SIMPLE-T_FIELDS OPTIONAL
+*"      E_T_DATA STRUCTURE  ZBW_HR_B2_ZES OPTIONAL
+*"  EXCEPTIONS
+*"      NO_MORE_DATA
+*"      ERROR_PASSED_TO_MESS_HANDLER
+*"      WRONG_CLUSTER_VERSION
+*"      NO_READ_AUTHORITY
+*"      CLUSTER_ARCHIVED
+*"      TECHNICAL_ERROR
+*"----------------------------------------------------------------------
+  TYPES: BEGIN OF tsy_pernr,
+
+           pernr TYPE p_pernr,
+           endda TYPE endda,
+           begda TYPE begda,
+
+         END OF tsy_pernr.
+
+* Static parameters
+  STATICS s_s_if              TYPE srsc_s_if_simple.
+  STATICS s_counter_datapakid TYPE sytabix.
+  STATICS s_s_if_sel          TYPE srsc_s_if_simple.
+  STATICS lt_pernr            TYPE TABLE OF tsy_pernr.
+
+  RANGES lr_pernr FOR zbw_hr_b2_zes-pernr.
+  RANGES lr_datum FOR zbw_hr_b2_zes-datum.
+
+  DATA lv_pernr     TYPE p_pernr.
+  DATA lv_begda     TYPE dats.
+  DATA lv_endda     TYPE dats.
+  DATA lt_tim_b2    TYPE hrf_tim_b2.
+  DATA lt_hr_b2_zes TYPE TABLE OF zbw_hr_b2_zes.
+  DATA ls_hr_b2_zes TYPE zbw_hr_b2_zes.
+  DATA ls_pernr     TYPE tsy_pernr.
+* Initialization mode (first call by SAPI) or data transfer mode
+* (following calls) ?
+  IF i_initflag = sbiwa_c_flag_on.
+
+* Check DataSource validity
+    CASE i_dsource.
+      WHEN 'ZBW_HR_B2_ZES'.
+      WHEN OTHERS.
+        IF 1 = 2.
+
+          MESSAGE e009(r3).
+
+        ENDIF.
+* this is a typical log call. Please write every error message like this
+        log_write 'E'                  "message type
+                  'R3'                 "message class
+                  '009'                "message number
+                  i_dsource   "message variable 1
+                  ' '.                 "message variable 2
+        RAISE error_passed_to_mess_handler.
+
+    ENDCASE.
+    s_s_if-requnr     = i_requnr.
+    s_s_if-dsource    = i_dsource.
+    s_s_if-maxsize    = i_maxsize.
+    s_s_if-t_select[] = I_T_SELECT[].
+* Fill field list table for an optimized select statement
+* (in case that there is no 1:1 relation between InfoSource fields
+* and database table fields this may be far from beeing trivial)
+    APPEND LINES OF i_t_fields TO s_s_if-t_fields.
+
+  ELSE.
+
+    IF s_counter_datapakid = 0.
+
+        LOOP AT s_s_if-t_select ASSIGNING FIELD-SYMBOL(<ls_select>).
+
+          CASE <ls_select>-fieldnm.
+            WHEN 'PERNR'.
+
+              MOVE-CORRESPONDING <ls_select> TO lr_pernr.
+              APPEND lr_pernr.
+
+            WHEN OTHERS.
+          ENDCASE.
+
+        ENDLOOP.
+
+        SELECT pernr endda begda FROM pa0002
+               INTO TABLE lt_pernr
+               WHERE pernr IN lr_pernr.
+*        DELETE lt_pernr WHERE NOT endda > lv_endda.
+*        DELETE lt_pernr WHERE NOT begda < lv_begda.
+        SORT lt_pernr. " BY pernr.
+*        DELETE ADJACENT DUPLICATES FROM lt_pernr COMPARING pernr.
+*        ls_pernr-pernr = pernr-pernr.
+*        APPEND ls_pernr TO lt_pernr.
+
+    ENDIF.
+    LOOP AT s_s_if-t_select ASSIGNING <ls_select>.
+
+      CASE <ls_select>-fieldnm.
+        WHEN 'DATUM'.
+
+          MOVE-CORRESPONDING <ls_select> TO lr_datum.
+          APPEND lr_datum.
+
+        WHEN OTHERS.
+
+      ENDCASE.
+
+    ENDLOOP.
+    IF lines( lr_datum ) = 0.
+
+      lr_datum-sign = 'I'.
+      lr_datum-option = 'BT'.
+      lr_datum-low = '01011000'.
+      lr_datum-high = '31129999'.
+      APPEND lr_datum.
+
+    ENDIF.
+    IF lines( lt_pernr[] ) = 0.
+
+      RAISE no_more_data.
+
+    ENDIF.
+    DO.
+
+      IF lines( lt_pernr ) > 0.
+
+        ASSIGN lt_pernr[ 1 ] TO FIELD-SYMBOL(<ls_pernr>).
+        lv_pernr = <ls_pernr>-pernr.
+        LOOP AT lr_datum ASSIGNING FIELD-SYMBOL(<ls_datum>).
+
+          IF NOT ( <ls_pernr>-begda < <ls_datum>-low AND
+                   <ls_pernr>-endda > <ls_datum>-high ).
+
+            CONTINUE.
+
+          ENDIF.
+          lv_begda = <ls_datum>-low.
+          lv_endda = <ls_datum>-high.
+          CALL FUNCTION 'HR_FORMS_TIM_GET_B2_RESULTS'
+               EXPORTING
+                        pernr                 = lv_pernr
+                        begda                 = lv_begda
+                        endda                 = lv_endda
+               IMPORTING
+                        tim_b2                = lt_tim_b2
+               EXCEPTIONS
+                        WRONG_CLUSTER_VERSION = 1
+                        NO_READ_AUTHORITY     = 2
+                        CLUSTER_ARCHIVED      = 3
+                        TECHNICAL_ERROR       = 4
+                        OTHERS                = 5.
+          CASE sy-subrc.
+            WHEN 1.
+              RAISE wrong_cluster_version.
+            WHEN 2.
+              RAISE no_read_authority.
+            WHEN 3.
+              RAISE cluster_archived.
+            WHEN 4.
+              RAISE technical_error.
+            WHEN OTHERS.
+          ENDCASE.
+          CLEAR lt_hr_b2_zes[].
+          LOOP AT lt_tim_b2-ft_zes ASSIGNING FIELD-SYMBOL(<ls_zes>).
+
+            MOVE-CORRESPONDING <ls_zes> TO ls_hr_b2_zes.
+            ls_hr_b2_zes-pernr = lv_pernr.
+            APPEND ls_hr_b2_zes TO lt_hr_b2_zes.
+
+          ENDLOOP.
+
+        ENDLOOP.
+        APPEND LINES OF lt_hr_b2_zes TO e_t_data.
+        DELETE lt_pernr INDEX 1.
+        IF lines( e_t_data ) > s_s_if-maxsize.
+
+          EXIT.
+
+        ENDIF.
+
+      ELSE.
+
+        EXIT.
+
+      ENDIF.
+
+    ENDDO.
+    s_counter_datapakid = s_counter_datapakid + 1.
+
+  ENDIF.
+
+ENDFUNCTION.
